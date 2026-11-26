@@ -1118,6 +1118,7 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p)
 	mm_init_uprobes_state(mm);
 	hugetlb_count_init(mm);
 	futex_mm_init(mm);
+	revelator_init_mm(mm);
 
 	mm_flags_clear_all(mm);
 	if (current->mm) {

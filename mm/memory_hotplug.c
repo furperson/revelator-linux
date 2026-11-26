@@ -215,6 +215,11 @@ void get_online_mems(void)
 	percpu_down_read(&mem_hotplug_lock);
 }
 
+bool try_get_online_mems(void)
+{
+	return percpu_down_read_trylock(&mem_hotplug_lock);
+}
+
 void put_online_mems(void)
 {
 	percpu_up_read(&mem_hotplug_lock);

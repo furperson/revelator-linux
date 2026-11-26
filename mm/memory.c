@@ -77,6 +77,7 @@
 #include <linux/vmalloc.h>
 #include <linux/sched/sysctl.h>
 #include <linux/pgalloc.h>
+#include <linux/revelator.h>
 #include <linux/uaccess.h>
 
 #include <trace/events/kmem.h>
@@ -87,6 +88,7 @@
 #include <asm/tlbflush.h>
 
 #include "pgalloc-track.h"
+#include "page_alloc.h"
 #include "internal.h"
 #include "swap.h"
 
@@ -448,9 +450,8 @@ void pmd_install(struct mm_struct *mm, pmd_t *pmd, pgtable_t *pte)
 	spin_unlock(ptl);
 }
 
-int __pte_alloc(struct mm_struct *mm, pmd_t *pmd)
+static int install_new_pte(struct mm_struct *mm, pmd_t *pmd, pgtable_t new)
 {
-	pgtable_t new = pte_alloc_one(mm);
 	if (!new)
 		return -ENOMEM;
 
@@ -458,6 +459,45 @@ int __pte_alloc(struct mm_struct *mm, pmd_t *pmd)
 	if (new)
 		pte_free(mm, new);
 	return 0;
+}
+
+int __pte_alloc(struct mm_struct *mm, pmd_t *pmd)
+{
+	return install_new_pte(mm, pmd, pte_alloc_one(mm));
+}
+
+#ifdef CONFIG_REVELATOR
+static pgtable_t pte_alloc_revelator_noprof(struct mm_struct *mm,
+		unsigned long addr, struct revelator_alloc *placement)
+{
+	struct page *page = alloc_revelator_page_noprof(
+			GFP_PGTABLE_USER | __GFP_COMP, placement);
+
+	if (!page)
+		return NULL;
+	revelator_account(mm, addr, true, placement->tier, page_to_pfn(page));
+	return __pte_alloc_one_from_ptdesc(mm, page_ptdesc(page));
+}
+#endif
+
+static inline int pte_alloc_anon(struct vm_fault *vmf)
+{
+	struct mm_struct *mm = vmf->vma->vm_mm;
+#ifdef CONFIG_REVELATOR
+	struct revelator_alloc placement;
+#endif
+
+	if (likely(!pmd_none(*vmf->pmd)))
+		return 0;
+#ifdef CONFIG_REVELATOR
+	placement.nr = revelator_candidates(mm, vmf->address, true, placement.pfns);
+	if (placement.nr) {
+		placement.table = true;
+		return install_new_pte(mm, vmf->pmd, alloc_hooks(
+				pte_alloc_revelator_noprof(mm, vmf->address, &placement)));
+	}
+#endif
+	return __pte_alloc(mm, vmf->pmd);
 }
 
 int __pte_alloc_kernel(pmd_t *pmd)
@@ -1280,13 +1320,41 @@ copy_pte:
 	return 1;
 }
 
+static inline struct folio *prealloc_zeroed_folio(struct mm_struct *mm,
+		struct vm_area_struct *vma, unsigned long addr, bool place)
+{
+#ifdef CONFIG_REVELATOR
+	if (place) {
+		struct revelator_alloc placement;
+
+		placement.nr = revelator_candidates(mm, addr, false, placement.pfns);
+		if (placement.nr) {
+			struct folio *folio;
+
+			placement.table = false;
+			folio = alloc_hooks(vma_alloc_revelator_folio_noprof(
+					GFP_HIGHUSER_MOVABLE, vma, addr, &placement));
+			if (folio) {
+				if (user_alloc_needs_zeroing())
+					clear_user_highpage(&folio->page, addr);
+				revelator_account(mm, addr, false, placement.tier,
+						  folio_pfn(folio));
+			}
+			return folio;
+		}
+	}
+#endif
+	return vma_alloc_zeroed_movable_folio(vma, addr);
+}
+
 static inline struct folio *folio_prealloc(struct mm_struct *src_mm,
-		struct vm_area_struct *vma, unsigned long addr, bool need_zero)
+		struct vm_area_struct *vma, unsigned long addr, bool need_zero,
+		bool place)
 {
 	struct folio *new_folio;
 
 	if (need_zero)
-		new_folio = vma_alloc_zeroed_movable_folio(vma, addr);
+		new_folio = prealloc_zeroed_folio(src_mm, vma, addr, place);
 	else
 		new_folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE, 0, vma, addr);
 
@@ -1439,7 +1507,7 @@ again:
 	} else if (ret == -EBUSY || unlikely(ret == -EHWPOISON)) {
 		goto out;
 	} else if (ret ==  -EAGAIN) {
-		prealloc = folio_prealloc(src_mm, src_vma, addr, false);
+		prealloc = folio_prealloc(src_mm, src_vma, addr, false, false);
 		if (!prealloc)
 			return -ENOMEM;
 	} else if (ret < 0) {
@@ -4014,7 +4082,7 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 		goto out;
 
 	pfn_is_zero = is_zero_pfn(pte_pfn(vmf->orig_pte));
-	new_folio = folio_prealloc(mm, vma, vmf->address, pfn_is_zero);
+	new_folio = folio_prealloc(mm, vma, vmf->address, pfn_is_zero, false);
 	if (!new_folio)
 		goto oom;
 
@@ -5427,7 +5495,8 @@ next:
 
 fallback:
 #endif
-	return folio_prealloc(vma->vm_mm, vma, vmf->address, true);
+	return folio_prealloc(vma->vm_mm, vma, vmf->address, true,
+			      vmf->flags & FAULT_FLAG_WRITE);
 }
 
 void map_anon_folio_pte_nopf(struct folio *folio, pte_t *pte,
@@ -5481,10 +5550,10 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 		return VM_FAULT_SIGBUS;
 
 	/*
-	 * Use pte_alloc() instead of pte_alloc_map(), so that OOM can
+	 * Allocate the table separately from mapping it, so that OOM can
 	 * be distinguished from a transient failure of pte_offset_map().
 	 */
-	if (pte_alloc(vma->vm_mm, vmf->pmd))
+	if (pte_alloc_anon(vmf))
 		return VM_FAULT_OOM;
 
 	/* Use the zero-page for reads */
@@ -6064,7 +6133,7 @@ static vm_fault_t do_cow_fault(struct vm_fault *vmf)
 	if (ret)
 		return ret;
 
-	folio = folio_prealloc(vma->vm_mm, vma, vmf->address, false);
+	folio = folio_prealloc(vma->vm_mm, vma, vmf->address, false, false);
 	if (!folio)
 		return VM_FAULT_OOM;
 

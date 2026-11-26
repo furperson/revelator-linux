@@ -57,6 +57,19 @@ static inline void pte_free_kernel(struct mm_struct *mm, pte_t *pte)
 	pagetable_dtor_free(virt_to_ptdesc(pte));
 }
 
+static inline pgtable_t __pte_alloc_one_from_ptdesc(struct mm_struct *mm,
+						   struct ptdesc *ptdesc)
+{
+	if (!ptdesc)
+		return NULL;
+	if (!pagetable_pte_ctor(mm, ptdesc)) {
+		pagetable_free(ptdesc);
+		return NULL;
+	}
+
+	return ptdesc_page(ptdesc);
+}
+
 /**
  * __pte_alloc_one - allocate memory for a PTE-level user page table
  * @mm: the mm_struct of the current context
@@ -71,17 +84,7 @@ static inline void pte_free_kernel(struct mm_struct *mm, pte_t *pte)
  */
 static inline pgtable_t __pte_alloc_one_noprof(struct mm_struct *mm, gfp_t gfp)
 {
-	struct ptdesc *ptdesc;
-
-	ptdesc = pagetable_alloc_noprof(gfp, 0);
-	if (!ptdesc)
-		return NULL;
-	if (!pagetable_pte_ctor(mm, ptdesc)) {
-		pagetable_free(ptdesc);
-		return NULL;
-	}
-
-	return ptdesc_page(ptdesc);
+	return __pte_alloc_one_from_ptdesc(mm, pagetable_alloc_noprof(gfp, 0));
 }
 #define __pte_alloc_one(...)	alloc_hooks(__pte_alloc_one_noprof(__VA_ARGS__))
 

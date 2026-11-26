@@ -15,6 +15,7 @@
 #include <asm/tlbflush.h>
 #include <asm/cacheflush.h>
 #include <asm/mmu_context.h>
+#include <asm/revelator.h>
 #include <asm/switch_to.h>
 
 #ifdef CONFIG_MMU
@@ -207,6 +208,14 @@ static void set_mm_noasid(struct mm_struct *mm)
 static inline void set_mm(struct mm_struct *prev,
 			  struct mm_struct *next, unsigned int cpu)
 {
+	bool revelator = riscv_revelator_enabled();
+	unsigned long flags;
+
+	if (revelator) {
+		local_irq_save(flags);
+		riscv_revelator_disable();
+	}
+
 	/*
 	 * The mm_cpumask indicates which harts' TLBs contain the virtual
 	 * address mapping of the mm. Compared to noasid, using asid
@@ -221,6 +230,11 @@ static inline void set_mm(struct mm_struct *prev,
 	} else {
 		cpumask_clear_cpu(cpu, mm_cpumask(prev));
 		set_mm_noasid(next);
+	}
+
+	if (revelator) {
+		riscv_revelator_bind(next);
+		local_irq_restore(flags);
 	}
 }
 

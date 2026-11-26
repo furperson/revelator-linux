@@ -237,6 +237,36 @@ struct page *__alloc_frozen_pages_noprof(gfp_t gfp, unsigned int order, int nid,
 		nodemask_t *nodemask, unsigned int alloc_flags);
 #define __alloc_frozen_pages(...) \
 	alloc_hooks(__alloc_frozen_pages_noprof(__VA_ARGS__))
+
+struct revelator_alloc {
+	unsigned long pfns[3];
+	u8 nr;
+	u8 tier;
+	bool table;
+};
+
+#ifdef CONFIG_REVELATOR
+struct page *alloc_revelator_frozen_pages_noprof(gfp_t gfp, int nid,
+		nodemask_t *nodemask, struct revelator_alloc *placement);
+struct page *alloc_revelator_page_noprof(gfp_t gfp,
+		struct revelator_alloc *placement);
+struct folio *vma_alloc_revelator_folio_noprof(gfp_t gfp,
+		struct vm_area_struct *vma, unsigned long addr,
+		struct revelator_alloc *placement);
+#endif
+
+static inline struct page *alloc_frozen_pages_for_placement_noprof(gfp_t gfp,
+		unsigned int order, int nid, nodemask_t *nodemask,
+		struct revelator_alloc *placement)
+{
+#ifdef CONFIG_REVELATOR
+	if (placement)
+		return alloc_revelator_frozen_pages_noprof(gfp, nid, nodemask,
+							  placement);
+#endif
+	return __alloc_frozen_pages_noprof(gfp, order, nid, nodemask, ALLOC_DEFAULT);
+}
+
 void free_frozen_pages(struct page *page, unsigned int order);
 void free_unref_folios(struct folio_batch *fbatch);
 

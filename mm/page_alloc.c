@@ -62,6 +62,10 @@
 #include "shuffle.h"
 #include "page_reporting.h"
 
+#ifdef CONFIG_REVELATOR_KUNIT_TEST
+#include <kunit/test.h>
+#endif
+
 /* Free Page Internal flags: for internal, non-pcp variants of free_pages(). */
 typedef int __bitwise fpi_t;
 
@@ -1717,29 +1721,41 @@ struct page *__pageblock_pfn_to_page(unsigned long start_pfn,
  *
  * -- nyc
  */
-static inline unsigned int expand(struct zone *zone, struct page *page, int low,
-				  int high, int migratetype)
+static __always_inline bool add_split_buddy(struct zone *zone, struct page *page,
+					    unsigned int order, int migratetype)
+{
+	VM_BUG_ON_PAGE(bad_range(zone, page), page);
+
+	/*
+	 * Guard pages stay out of the freelist, but can merge back when
+	 * the allocated buddy is freed.
+	 */
+	if (set_page_guard(zone, page, order))
+		return false;
+
+	__add_to_free_list(page, zone, order, migratetype, false);
+	set_buddy_order(page, order);
+	return true;
+}
+
+static __always_inline unsigned int expand(struct zone *zone, struct page *page,
+		int low, int high, int migratetype, struct page *target)
 {
 	unsigned int size = 1 << high;
 	unsigned int nr_added = 0;
 
 	while (high > low) {
+		struct page *buddy;
+
 		high--;
 		size >>= 1;
-		VM_BUG_ON_PAGE(bad_range(zone, &page[size]), &page[size]);
-
-		/*
-		 * Mark as guard pages (or page), that will allow to
-		 * merge back to allocator when buddy will be freed.
-		 * Corresponding page table entries will not be touched,
-		 * pages will stay not present in virtual address space
-		 */
-		if (set_page_guard(zone, &page[size], high))
-			continue;
-
-		__add_to_free_list(&page[size], zone, high, migratetype, false);
-		set_buddy_order(&page[size], high);
-		nr_added += size;
+		buddy = page + size;
+		if (target && target >= buddy) {
+			buddy = page;
+			page += size;
+		}
+		if (add_split_buddy(zone, buddy, high, migratetype))
+			nr_added += size;
 	}
 
 	return nr_added;
@@ -1752,7 +1768,21 @@ static __always_inline void page_del_and_expand(struct zone *zone,
 	int nr_pages = 1 << high;
 
 	__del_page_from_free_list(page, zone, high, migratetype);
-	nr_pages -= expand(zone, page, low, high, migratetype);
+	nr_pages -= expand(zone, page, low, high, migratetype, NULL);
+	account_freepages(zone, -nr_pages, migratetype);
+}
+
+/*
+ * Remove the free block and split toward the target, not necessarily the
+ * lower half. Account only the target and any guard pages as removed.
+ */
+static inline void break_down_buddy_pages(struct zone *zone, struct page *head,
+		struct page *target, unsigned int order, int migratetype)
+{
+	unsigned int nr_pages = 1U << order;
+
+	__del_page_from_free_list(head, zone, order, migratetype);
+	nr_pages -= expand(zone, head, 0, order, migratetype, target);
 	account_freepages(zone, -nr_pages, migratetype);
 }
 
@@ -2307,10 +2337,10 @@ find_suitable_fallback(struct free_area *area, unsigned int order,
  * pages are free or compatible, we can still claim the whole block, so pages
  * freed in the future will be put on the correct free list.
  */
-static struct page *
+static __always_inline struct page *
 try_to_claim_block(struct zone *zone, struct page *page,
 		   int current_order, int order, int start_type,
-		   int block_type, unsigned int alloc_flags)
+		   int block_type, unsigned int alloc_flags, struct page *target)
 {
 	int free_pages, movable_pages, alike_pages;
 	unsigned long start_pfn;
@@ -2321,9 +2351,9 @@ try_to_claim_block(struct zone *zone, struct page *page,
 
 		del_page_from_free_list(page, zone, current_order, block_type);
 		change_pageblock_range(page, current_order, start_type);
-		nr_added = expand(zone, page, order, current_order, start_type);
+		nr_added = expand(zone, page, order, current_order, start_type, target);
 		account_freepages(zone, nr_added, start_type);
-		return page;
+		return target ?: page;
 	}
 
 	/*
@@ -2331,7 +2361,7 @@ try_to_claim_block(struct zone *zone, struct page *page,
 	 * likelihood of future fallbacks. Wake kswapd now as the node
 	 * may be balanced overall and kswapd will not wake naturally.
 	 */
-	if (boost_watermark(zone) && (alloc_flags & ALLOC_KSWAPD))
+	if (!target && boost_watermark(zone) && (alloc_flags & ALLOC_KSWAPD))
 		set_bit(ZONE_BOOSTED_WATERMARK, &zone->flags);
 
 	/* moving whole block can fail due to zone boundary conditions */
@@ -2368,6 +2398,12 @@ try_to_claim_block(struct zone *zone, struct page *page,
 			page_group_by_mobility_disabled) {
 		__move_freepages_block(zone, start_pfn, block_type, start_type);
 		set_pageblock_migratetype(pfn_to_page(start_pfn), start_type);
+		if (target) {
+			if (boost_watermark(zone) && (alloc_flags & ALLOC_KSWAPD))
+				set_bit(ZONE_BOOSTED_WATERMARK, &zone->flags);
+			break_down_buddy_pages(zone, page, target, current_order, start_type);
+			return target;
+		}
 		return __rmqueue_smallest(zone, order, start_type);
 	}
 
@@ -2422,7 +2458,7 @@ __rmqueue_claim(struct zone *zone, int order, int start_migratetype,
 		page = get_page_from_free_area(area, fallback_mt);
 		page = try_to_claim_block(zone, page, current_order, order,
 					  start_migratetype, fallback_mt,
-					  alloc_flags);
+					  alloc_flags, NULL);
 		if (page) {
 			trace_mm_page_alloc_extfrag(page, order, current_order,
 						    start_migratetype, fallback_mt);
@@ -3412,6 +3448,16 @@ static struct page *rmqueue_pcplist(struct zone *preferred_zone,
 	return page;
 }
 
+static inline void wake_kswapd_if_boosted(struct zone *zone, unsigned int alloc_flags)
+{
+	/* Separate test+clear to avoid unnecessary atomics */
+	if ((alloc_flags & ALLOC_KSWAPD) &&
+	    unlikely(test_bit(ZONE_BOOSTED_WATERMARK, &zone->flags))) {
+		clear_bit(ZONE_BOOSTED_WATERMARK, &zone->flags);
+		wakeup_kswapd(zone, 0, 0, zone_idx(zone));
+	}
+}
+
 /*
  * Allocate a page from the given zone.
  * Use pcplists for THP or "cheap" high-order allocations.
@@ -3443,12 +3489,7 @@ struct page *rmqueue(struct zone *preferred_zone,
 							migratetype);
 
 out:
-	/* Separate test+clear to avoid unnecessary atomics */
-	if ((alloc_flags & ALLOC_KSWAPD) &&
-	    unlikely(test_bit(ZONE_BOOSTED_WATERMARK, &zone->flags))) {
-		clear_bit(ZONE_BOOSTED_WATERMARK, &zone->flags);
-		wakeup_kswapd(zone, 0, 0, zone_idx(zone));
-	}
+	wake_kswapd_if_boosted(zone, alloc_flags);
 
 	VM_BUG_ON_PAGE(page && bad_range(zone, page), page);
 	return page;
@@ -3806,6 +3847,282 @@ static inline unsigned int alloc_flags_cma(gfp_t gfp_mask)
 #endif
 	return ALLOC_DEFAULT;
 }
+
+#ifdef CONFIG_REVELATOR
+/* The caller pins the memmap and holds zone->lock. */
+static bool revelator_take_pfn(struct zone *zone, struct page *page,
+			      unsigned long pfn, int migratetype,
+			      unsigned int alloc_flags, bool allow_claim)
+{
+	unsigned long min_pfn = ALIGN_DOWN(pfn, MAX_ORDER_NR_PAGES);
+	unsigned long head_pfn = pfn;
+	struct page *head = page;
+	int block_type;
+
+	lockdep_assert_held(&zone->lock);
+	if (PageReserved(page) || PageOffline(page) || PageHWPoison(page) ||
+	    page_ref_count(page) || !migratetype_is_mergeable(migratetype))
+		return false;
+
+	block_type = get_pfnblock_migratetype(page, pfn);
+	if (!migratetype_is_mergeable(block_type))
+		return false;
+
+	for (;;) {
+		if (PageBuddy(head)) {
+			unsigned int order = buddy_order(head);
+
+			if (pfn - head_pfn < (1UL << order)) {
+				if (get_pfnblock_migratetype(head, head_pfn) != block_type)
+					return false;
+				if (block_type == migratetype) {
+					break_down_buddy_pages(zone, head, page, order, block_type);
+					return true;
+				}
+				/*
+				 * Claim ordinary pageblocks for PTE pages rather
+				 * than stealing unmovable pages into movable blocks.
+				 */
+				if (!allow_claim ||
+				    ((alloc_flags & ALLOC_NOFRAGMENT) && order < pageblock_order) ||
+				    !should_try_claim_block(order, migratetype))
+					return false;
+				if (!try_to_claim_block(zone, head, order, 0, migratetype,
+							block_type, alloc_flags, page))
+					return false;
+				trace_mm_page_alloc_extfrag(page, 0, order, migratetype, block_type);
+				return true;
+			}
+		}
+
+		if (head_pfn == min_pfn)
+			return false;
+		head_pfn &= head_pfn - 1;
+		if (!zone_spans_pfn(zone, head_pfn))
+			return false;
+		head = pfn_to_online_page(head_pfn);
+		if (!head || page_zone(head) != zone)
+			return false;
+	}
+}
+
+static struct page *get_revelator_page(gfp_t gfp, unsigned int alloc_flags,
+				     const struct alloc_context *ac,
+				     struct revelator_alloc *placement)
+{
+	struct zone *preferred_zone = zonelist_zone(ac->preferred_zoneref);
+	struct page *page = NULL;
+	unsigned int i;
+
+	/* Don't wait on hotplug while holding fault-path locks. */
+	if (!try_get_online_mems())
+		return NULL;
+
+	for (i = 0; i < placement->nr; i++) {
+		unsigned long pfn = placement->pfns[i];
+		struct zoneref *z = ac->preferred_zoneref;
+		struct page *candidate = pfn_to_online_page(pfn);
+		struct zone *zone, *target;
+		unsigned long flags, mark;
+
+		if (!candidate)
+			continue;
+		target = page_zone(candidate);
+		for_next_zone_zonelist_nodemask(zone, z, ac->highest_zoneidx,
+						ac->nodemask) {
+			if (zone == target)
+				break;
+		}
+		if (!zone ||
+		    (cpusets_enabled() && (alloc_flags & ALLOC_CPUSET) &&
+		     !__cpuset_zone_allowed(zone, gfp)) ||
+		    (ac->spread_dirty_pages && !node_dirty_ok(zone->zone_pgdat)))
+			continue;
+
+		spin_lock_irqsave(&zone->lock, flags);
+		mark = wmark_pages(zone, alloc_flags & ALLOC_WMARK_MASK);
+		if (zone_watermark_fast(zone, 0, mark, ac->highest_zoneidx,
+					alloc_flags, gfp) &&
+		    revelator_take_pfn(zone, candidate, pfn, ac->migratetype,
+				       alloc_flags, placement->table)) {
+			page = candidate;
+			trace_mm_page_alloc_zone_locked(page, 0, ac->migratetype, false);
+		}
+		spin_unlock_irqrestore(&zone->lock, flags);
+		if (page)
+			wake_kswapd_if_boosted(zone, alloc_flags);
+
+		if (page && !check_new_pages(page, 0))
+			break;
+		page = NULL;
+	}
+	put_online_mems();
+
+	if (page) {
+		__count_zid_vm_events(PGALLOC, page_zonenum(page), 1);
+		zone_statistics(preferred_zone, page_zone(page), 1);
+		prep_new_page(page, 0, gfp, alloc_flags);
+		placement->tier = i + 1;
+	}
+	return page;
+}
+#endif
+
+#ifdef CONFIG_REVELATOR_KUNIT_TEST
+static void revelator_buddy_split_test(struct kunit *test)
+{
+	unsigned long before[NR_PAGE_ORDERS];
+	struct zone *zone;
+
+	get_online_mems();
+	for_each_populated_zone(zone) {
+		bool found = false, left = false, right = false;
+		bool busy = false, incompatible = false, restored = true;
+		unsigned long flags;
+		unsigned int order, i;
+
+		spin_lock_irqsave(&zone->lock, flags);
+		for (order = 1; order < NR_PAGE_ORDERS && !found; order++) {
+			int mt;
+
+			for (mt = 0; mt < MIGRATE_PCPTYPES; mt++) {
+				struct page *head = get_page_from_free_area(
+						&zone->free_area[order], mt);
+				struct page *tail;
+				unsigned long pfn, last;
+
+				if (!head)
+					continue;
+
+				found = true;
+				pfn = page_to_pfn(head);
+				last = pfn + (1UL << order) - 1;
+				tail = head + (last - pfn);
+				for (i = 0; i < NR_PAGE_ORDERS; i++)
+					before[i] = zone->free_area[i].nr_free;
+
+				incompatible = !revelator_take_pfn(zone, head, pfn,
+						(mt + 1) % MIGRATE_PCPTYPES, 0, false);
+				if (!incompatible)
+					__free_one_page(head, pfn, zone, 0, mt,
+							FPI_SKIP_REPORT_NOTIFY);
+				left = revelator_take_pfn(zone, head, pfn, mt, 0, false);
+				if (left) {
+					busy = !revelator_take_pfn(zone, head, pfn, mt, 0, false);
+					__free_one_page(head, pfn, zone, 0, mt,
+							FPI_SKIP_REPORT_NOTIFY);
+				}
+				right = revelator_take_pfn(zone, tail, last, mt, 0, false);
+				if (right) {
+					busy &= !revelator_take_pfn(zone, tail, last, mt, 0, false);
+					__free_one_page(tail, last, zone, 0, mt,
+							FPI_SKIP_REPORT_NOTIFY);
+				}
+				for (i = 0; i < NR_PAGE_ORDERS; i++)
+					restored &= before[i] == zone->free_area[i].nr_free;
+				break;
+			}
+		}
+		spin_unlock_irqrestore(&zone->lock, flags);
+
+		if (!found)
+			continue;
+		put_online_mems();
+		KUNIT_EXPECT_TRUE(test, incompatible);
+		KUNIT_EXPECT_TRUE(test, left);
+		KUNIT_EXPECT_TRUE(test, busy);
+		KUNIT_EXPECT_TRUE(test, right);
+		KUNIT_EXPECT_TRUE(test, restored);
+		return;
+	}
+	put_online_mems();
+	kunit_skip(test, "no splittable buddy block");
+}
+
+static void revelator_buddy_claim_test(struct kunit *test)
+{
+	struct zone *zone;
+
+	get_online_mems();
+	for_each_populated_zone(zone) {
+		unsigned long before[NR_PAGE_ORDERS], flags;
+		bool found = false, taken = false, retyped = true, restored = true;
+		bool exact = true;
+		unsigned int order, i;
+
+		spin_lock_irqsave(&zone->lock, flags);
+		for (order = pageblock_order; order < NR_PAGE_ORDERS; order++) {
+			struct page *head = get_page_from_free_area(
+					&zone->free_area[order], MIGRATE_MOVABLE);
+			unsigned long first, last, pfn;
+			struct page *target;
+
+			if (!head)
+				continue;
+
+			found = true;
+			first = page_to_pfn(head);
+			last = first + (1UL << order) - 1;
+			target = pfn_to_page(last);
+			for (i = 0; i < NR_PAGE_ORDERS; i++)
+				before[i] = zone->free_area[i].nr_free;
+
+			taken = revelator_take_pfn(zone, target, last, MIGRATE_UNMOVABLE,
+						  ALLOC_NOFRAGMENT, true);
+			if (taken) {
+				for (i = 0; i <= order; i++) {
+					unsigned long aligned = ALIGN_DOWN(last, 1UL << i);
+					struct page *cover = pfn_to_page(aligned);
+
+					if (PageBuddy(cover) && buddy_order(cover) >= i) {
+						exact = false;
+						break;
+					}
+				}
+
+				/* Restore the original block(s) before freeing the target. */
+				for (pfn = first; pfn <= last; pfn += pageblock_nr_pages) {
+					retyped &= get_pfnblock_migratetype(pfn_to_page(pfn), pfn)
+						   == MIGRATE_UNMOVABLE;
+					__move_freepages_block(zone, pfn, MIGRATE_UNMOVABLE,
+							       MIGRATE_MOVABLE);
+				}
+				change_pageblock_range(head, order, MIGRATE_MOVABLE);
+				if (exact)
+					__free_one_page(target, last, zone, 0, MIGRATE_MOVABLE,
+							FPI_SKIP_REPORT_NOTIFY);
+				for (i = 0; i < NR_PAGE_ORDERS; i++)
+					restored &= before[i] == zone->free_area[i].nr_free;
+			}
+			break;
+		}
+		spin_unlock_irqrestore(&zone->lock, flags);
+
+		if (!found)
+			continue;
+		put_online_mems();
+		KUNIT_EXPECT_TRUE(test, taken);
+		KUNIT_EXPECT_TRUE(test, exact);
+		KUNIT_EXPECT_TRUE(test, retyped);
+		KUNIT_EXPECT_TRUE(test, restored);
+		return;
+	}
+	put_online_mems();
+	kunit_skip(test, "no free movable pageblock");
+}
+
+static struct kunit_case revelator_buddy_cases[] = {
+	KUNIT_CASE(revelator_buddy_split_test),
+	KUNIT_CASE(revelator_buddy_claim_test),
+	{}
+};
+
+static struct kunit_suite revelator_buddy_suite = {
+	.name = "revelator_buddy",
+	.test_cases = revelator_buddy_cases,
+};
+kunit_test_suite(revelator_buddy_suite);
+#endif
 
 /*
  * get_page_from_freelist goes through the zonelist trying to allocate
@@ -5423,8 +5740,9 @@ static const gfp_t gfp_nolock = __GFP_NOWARN | __GFP_ZERO | __GFP_NOMEMALLOC |
 /*
  * This is the 'heart' of the zoned buddy allocator.
  */
-struct page *__alloc_frozen_pages_noprof(gfp_t gfp, unsigned int order,
-		int preferred_nid, nodemask_t *nodemask, unsigned int alloc_flags)
+static struct page *alloc_frozen_pages_with_placement(gfp_t gfp,
+		unsigned int order, int preferred_nid, nodemask_t *nodemask,
+		unsigned int alloc_flags, struct revelator_alloc *placement)
 {
 	struct page *page;
 	gfp_t alloc_gfp; /* The gfp_t that was actually used for allocation */
@@ -5475,6 +5793,16 @@ struct page *__alloc_frozen_pages_noprof(gfp_t gfp, unsigned int order,
 	}
 	fastpath_alloc_flags |= alloc_flags_nonblocking(gfp, order) & ALLOC_HIGHATOMIC;
 
+#ifdef CONFIG_REVELATOR
+	/* Do not carry the one-shot request into reclaim or retry. */
+	if (placement) {
+		page = get_revelator_page(alloc_gfp, fastpath_alloc_flags, &ac,
+					  placement);
+		if (page)
+			goto out;
+	}
+#endif
+
 	/* First allocation attempt (or, for nolock, only attempt) */
 	page = get_page_from_freelist(alloc_gfp, order, fastpath_alloc_flags, &ac);
 	if (likely(page) || (alloc_flags & ALLOC_NOLOCK))
@@ -5504,7 +5832,50 @@ out:
 
 	return page;
 }
+
+struct page *__alloc_frozen_pages_noprof(gfp_t gfp, unsigned int order,
+		int preferred_nid, nodemask_t *nodemask, unsigned int alloc_flags)
+{
+	return alloc_frozen_pages_with_placement(gfp, order, preferred_nid,
+						 nodemask, alloc_flags, NULL);
+}
 EXPORT_SYMBOL(__alloc_frozen_pages_noprof);
+
+#ifdef CONFIG_REVELATOR
+struct page *alloc_revelator_frozen_pages_noprof(gfp_t gfp, int nid,
+		nodemask_t *nodemask, struct revelator_alloc *placement)
+{
+	struct page *page;
+
+	placement->tier = 0;
+	page = alloc_frozen_pages_with_placement(gfp, 0, nid, nodemask,
+						 ALLOC_DEFAULT, placement);
+	if (!page)
+		placement->tier = 0;
+	return page;
+}
+
+#ifndef CONFIG_NUMA
+struct page *alloc_revelator_page_noprof(gfp_t gfp,
+		struct revelator_alloc *placement)
+{
+	struct page *page = alloc_revelator_frozen_pages_noprof(gfp, numa_node_id(),
+							      NULL, placement);
+
+	if (page)
+		set_page_refcounted(page);
+	return page;
+}
+
+struct folio *vma_alloc_revelator_folio_noprof(gfp_t gfp,
+		struct vm_area_struct *vma, unsigned long addr,
+		struct revelator_alloc *placement)
+{
+	return page_rmappable_folio(alloc_revelator_page_noprof(gfp | __GFP_COMP,
+							      placement));
+}
+#endif /* !CONFIG_NUMA */
+#endif /* CONFIG_REVELATOR */
 
 struct page *__alloc_pages_noprof(gfp_t gfp, unsigned int order,
 		int preferred_nid, nodemask_t *nodemask, unsigned int alloc_flags)
@@ -7827,44 +8198,6 @@ bool is_free_buddy_page(const struct page *page)
 EXPORT_SYMBOL(is_free_buddy_page);
 
 #ifdef CONFIG_MEMORY_FAILURE
-static inline void add_to_free_list(struct page *page, struct zone *zone,
-				    unsigned int order, int migratetype,
-				    bool tail)
-{
-	__add_to_free_list(page, zone, order, migratetype, tail);
-	account_freepages(zone, 1 << order, migratetype);
-}
-
-/*
- * Break down a higher-order page in sub-pages, and keep our target out of
- * buddy allocator.
- */
-static void break_down_buddy_pages(struct zone *zone, struct page *page,
-				   struct page *target, int low, int high,
-				   int migratetype)
-{
-	unsigned long size = 1 << high;
-	struct page *current_buddy;
-
-	while (high > low) {
-		high--;
-		size >>= 1;
-
-		if (target >= &page[size]) {
-			current_buddy = page;
-			page = page + size;
-		} else {
-			current_buddy = page + size;
-		}
-
-		if (set_page_guard(zone, current_buddy, high))
-			continue;
-
-		add_to_free_list(current_buddy, zone, high, migratetype, false);
-		set_buddy_order(current_buddy, high);
-	}
-}
-
 /*
  * Take a page that will be marked as poisoned off the buddy allocator.
  */
@@ -7884,10 +8217,8 @@ bool take_page_off_buddy(struct page *page)
 			int migratetype = get_pfnblock_migratetype(page_head,
 								   pfn_head);
 
-			del_page_from_free_list(page_head, zone, page_order,
-						migratetype);
-			break_down_buddy_pages(zone, page_head, page, 0,
-						page_order, migratetype);
+			break_down_buddy_pages(zone, page_head, page, page_order,
+					       migratetype);
 			SetPageHWPoisonTakenOff(page);
 			return true;
 		}

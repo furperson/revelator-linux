@@ -157,6 +157,7 @@ int add_pages(int nid, unsigned long start_pfn, unsigned long nr_pages,
 #endif /* ARCH_HAS_ADD_PAGES */
 
 void get_online_mems(void);
+bool try_get_online_mems(void);
 void put_online_mems(void);
 
 void mem_hotplug_begin(void);
@@ -205,6 +206,7 @@ static inline int try_online_node(int nid)
 }
 
 static inline void get_online_mems(void) {}
+static inline bool try_get_online_mems(void) { return true; }
 static inline void put_online_mems(void) {}
 
 static inline void mem_hotplug_begin(void) {}

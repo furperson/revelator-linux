@@ -16,6 +16,7 @@
 #include <linux/sched.h>
 #include <linux/console.h>
 #include <linux/of_fdt.h>
+#include <linux/revelator.h>
 #include <linux/sched/task.h>
 #include <linux/smp.h>
 #include <linux/efi.h>
@@ -335,6 +336,7 @@ void __init setup_arch(char **cmdline_p)
 	}
 
 	misc_mem_init();
+	revelator_init();
 
 	init_resources();
 

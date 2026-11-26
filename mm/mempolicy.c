@@ -2405,7 +2405,7 @@ bool mempolicy_in_oom_domain(struct task_struct *tsk,
 }
 
 static struct page *alloc_pages_preferred_many(gfp_t gfp, unsigned int order,
-						int nid, nodemask_t *nodemask)
+		int nid, nodemask_t *nodemask, struct revelator_alloc *placement)
 {
 	struct page *page;
 	gfp_t preferred_gfp;
@@ -2418,8 +2418,8 @@ static struct page *alloc_pages_preferred_many(gfp_t gfp, unsigned int order,
 	 */
 	preferred_gfp = gfp | __GFP_NOWARN;
 	preferred_gfp &= ~(__GFP_DIRECT_RECLAIM | __GFP_NOFAIL);
-	page = __alloc_frozen_pages_noprof(preferred_gfp, order, nid, nodemask,
-					   ALLOC_DEFAULT);
+	page = alloc_frozen_pages_for_placement_noprof(preferred_gfp, order, nid,
+						       nodemask, placement);
 	if (!page)
 		page = __alloc_frozen_pages_noprof(gfp, order, nid, NULL,
 						   ALLOC_DEFAULT);
@@ -2434,11 +2434,13 @@ static struct page *alloc_pages_preferred_many(gfp_t gfp, unsigned int order,
  * @pol: Pointer to the NUMA mempolicy.
  * @ilx: Index for interleave mempolicy (also distinguishes alloc_pages()).
  * @nid: Preferred node (usually numa_node_id() but @mpol may override it).
+ * @placement: Optional one-shot exact-PFN request, for order zero only.
  *
  * Return: The page on success or NULL if allocation fails.
  */
 static struct page *alloc_pages_mpol(gfp_t gfp, unsigned int order,
-		struct mempolicy *pol, pgoff_t ilx, int nid)
+		struct mempolicy *pol, pgoff_t ilx, int nid,
+		struct revelator_alloc *placement)
 {
 	nodemask_t *nodemask;
 	struct page *page;
@@ -2446,7 +2448,7 @@ static struct page *alloc_pages_mpol(gfp_t gfp, unsigned int order,
 	nodemask = policy_nodemask(gfp, pol, ilx, &nid);
 
 	if (pol->mode == MPOL_PREFERRED_MANY)
-		return alloc_pages_preferred_many(gfp, order, nid, nodemask);
+		return alloc_pages_preferred_many(gfp, order, nid, nodemask, placement);
 
 	if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) &&
 	    /* filter "hugepage" allocation, unless from alloc_pages() */
@@ -2482,7 +2484,8 @@ static struct page *alloc_pages_mpol(gfp_t gfp, unsigned int order,
 		}
 	}
 
-	page = __alloc_frozen_pages_noprof(gfp, order, nid, nodemask, ALLOC_DEFAULT);
+	page = alloc_frozen_pages_for_placement_noprof(gfp, order, nid, nodemask,
+						       placement);
 
 	if (unlikely(pol->mode == MPOL_INTERLEAVE ||
 		     pol->mode == MPOL_WEIGHTED_INTERLEAVE) && page) {
@@ -2498,16 +2501,41 @@ static struct page *alloc_pages_mpol(gfp_t gfp, unsigned int order,
 	return page;
 }
 
-struct folio *folio_alloc_mpol_noprof(gfp_t gfp, unsigned int order,
-		struct mempolicy *pol, pgoff_t ilx, int nid)
+static struct folio *folio_alloc_mpol_policy_noprof(gfp_t gfp, unsigned int order,
+		struct mempolicy *pol, pgoff_t ilx, int nid,
+		struct revelator_alloc *placement)
 {
-	struct page *page = alloc_pages_mpol(gfp | __GFP_COMP, order, pol,
-			ilx, nid);
+	struct page *page = alloc_pages_mpol(gfp | __GFP_COMP, order, pol, ilx,
+					    nid, placement);
 	if (!page)
 		return NULL;
 
 	set_page_refcounted(page);
 	return page_rmappable_folio(page);
+}
+
+struct folio *folio_alloc_mpol_noprof(gfp_t gfp, unsigned int order,
+		struct mempolicy *pol, pgoff_t ilx, int nid)
+{
+	return folio_alloc_mpol_policy_noprof(gfp, order, pol, ilx, nid, NULL);
+}
+
+static struct folio *vma_alloc_folio_policy_noprof(gfp_t gfp, int order,
+		struct vm_area_struct *vma, unsigned long addr,
+		struct revelator_alloc *placement)
+{
+	struct mempolicy *pol;
+	pgoff_t ilx;
+	struct folio *folio;
+
+	if (vma->vm_flags & VM_DROPPABLE)
+		gfp |= __GFP_NOWARN;
+
+	pol = get_vma_policy(vma, addr, order, &ilx);
+	folio = folio_alloc_mpol_policy_noprof(gfp, order, pol, ilx,
+					      numa_node_id(), placement);
+	mpol_cond_put(pol);
+	return folio;
 }
 
 /**
@@ -2528,21 +2556,12 @@ struct folio *folio_alloc_mpol_noprof(gfp_t gfp, unsigned int order,
 struct folio *vma_alloc_folio_noprof(gfp_t gfp, int order, struct vm_area_struct *vma,
 		unsigned long addr)
 {
-	struct mempolicy *pol;
-	pgoff_t ilx;
-	struct folio *folio;
-
-	if (vma->vm_flags & VM_DROPPABLE)
-		gfp |= __GFP_NOWARN;
-
-	pol = get_vma_policy(vma, addr, order, &ilx);
-	folio = folio_alloc_mpol_noprof(gfp, order, pol, ilx, numa_node_id());
-	mpol_cond_put(pol);
-	return folio;
+	return vma_alloc_folio_policy_noprof(gfp, order, vma, addr, NULL);
 }
 EXPORT_SYMBOL(vma_alloc_folio_noprof);
 
-struct page *alloc_frozen_pages_noprof(gfp_t gfp, unsigned order)
+static struct page *alloc_frozen_pages_policy_noprof(gfp_t gfp, unsigned int order,
+		struct revelator_alloc *placement)
 {
 	struct mempolicy *pol = &default_policy;
 
@@ -2554,8 +2573,32 @@ struct page *alloc_frozen_pages_noprof(gfp_t gfp, unsigned order)
 		pol = get_task_policy(current);
 
 	return alloc_pages_mpol(gfp, order, pol, NO_INTERLEAVE_INDEX,
-				       numa_node_id());
+			       numa_node_id(), placement);
 }
+
+struct page *alloc_frozen_pages_noprof(gfp_t gfp, unsigned int order)
+{
+	return alloc_frozen_pages_policy_noprof(gfp, order, NULL);
+}
+
+#ifdef CONFIG_REVELATOR
+struct folio *vma_alloc_revelator_folio_noprof(gfp_t gfp,
+		struct vm_area_struct *vma, unsigned long addr,
+		struct revelator_alloc *placement)
+{
+	return vma_alloc_folio_policy_noprof(gfp, 0, vma, addr, placement);
+}
+
+struct page *alloc_revelator_page_noprof(gfp_t gfp,
+		struct revelator_alloc *placement)
+{
+	struct page *page = alloc_frozen_pages_policy_noprof(gfp, 0, placement);
+
+	if (page)
+		set_page_refcounted(page);
+	return page;
+}
+#endif
 
 /**
  * alloc_pages - Allocate pages.

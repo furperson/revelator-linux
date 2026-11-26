@@ -1511,6 +1511,22 @@ config LAZY_MMU_MODE_KUNIT_TEST
 
 	  If unsure, say N.
 
+config REVELATOR
+	bool "Revelator experimental Sv48 page placement"
+	depends on RISCV && 64BIT && MMU && !RISCV_M_MODE
+	help
+	  Try address-derived physical frames for eligible user pages with
+	  revelator=data or revelator=data+pt. Requires the matching 4 KiB,
+	  single-node, 2 GiB RAM profile. The default boot mode is off.
+	  An optional emulator ABI can observe context and allocation counts.
+
+config REVELATOR_KUNIT_TEST
+	bool "KUnit tests for Revelator" if !KUNIT_ALL_TESTS
+	depends on REVELATOR && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Check the fixed CityHash ABI and the Sv48 candidate addresses.
+
 source "mm/damon/Kconfig"
 
 endmenu
