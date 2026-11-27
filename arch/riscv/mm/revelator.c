@@ -20,6 +20,7 @@
 #define CSR_REVELATOR_TIER2	0x5c5
 #define CSR_REVELATOR_TIER3	0x5c6
 #define CSR_REVELATOR_FALLBACK	0x5c7
+#define CSR_REVELATOR_HASH	0x5c8
 
 #define REVELATOR_DISABLE	0
 #define REVELATOR_BIND		1
@@ -87,6 +88,7 @@ void riscv_revelator_bind(struct mm_struct *mm)
 	raw_spin_lock(&state->lock);
 	csr_write(CSR_REVELATOR_MM_ID, state->id);
 	csr_write(CSR_REVELATOR_SECRET, state->secret);
+	csr_write(CSR_REVELATOR_HASH, state->algorithm);
 	csr_write(CSR_REVELATOR_SATP, csr_read(CSR_SATP));
 	revelator_write_counts(state);
 	csr_write(CSR_REVELATOR_CONTROL, REVELATOR_BIND);

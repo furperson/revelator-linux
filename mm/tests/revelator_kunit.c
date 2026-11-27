@@ -56,6 +56,79 @@ static void revelator_hash_vectors(struct kunit *test)
 		}
 	}
 }
+static void revelator_compact_vectors(struct kunit *test)
+{
+	static const struct {
+		u64 x;
+		u64 id;
+		u64 secret;
+		u64 mix13[3];
+		u64 multiply_shift[3];
+	} vectors[] = {
+		{
+			0, 0, 0,
+			{ 0xe220a8397b1dcdafULL, 0x6e789e6aa1b965f4ULL,
+			  0x06c45d188009454fULL },
+			{ 0x105deULL, 0x20bbdULL, 0x3119bULL },
+		}, {
+			0x10000000, 1, 2,
+			{ 0xb4f30eefaf3d8476ULL, 0x740d9a7556b162d5ULL,
+			  0xfd210a2b08c45481ULL },
+			{ 0x1c2b5ULL, 0x2c894ULL, 0x3ce72ULL },
+		}, {
+			0x80000, 1, 2,
+			{ 0xabdd2e8dbb70c28aULL, 0x98f9bd7c3b7cdc40ULL,
+			  0x522cd1ac5ae2cf09ULL },
+			{ 0x13fbULL, 0x119d9ULL, 0x21fb8ULL },
+		}, {
+			0xfffffffffULL, 0x123456789abcdef0ULL,
+			0xfedcba9876543210ULL,
+			{ 0x04932a5575fda4e0ULL, 0x00a9395013f8df92ULL,
+			  0xf8aa729a56e04b4dULL },
+			{ 0x1c21fULL, 0x2c7feULL, 0x3cddcULL },
+		}, {
+			0x7ffffffULL, 0x123456789abcdef0ULL,
+			0xfedcba9876543210ULL,
+			{ 0x5424fd88f24401bULL, 0x3eaf11d961aa7edaULL,
+			  0x6f95b0f2e5f77a30ULL },
+			{ 0x3078bULL, 0x40d69ULL, 0x51348ULL },
+		},
+	};
+
+	for (size_t i = 0; i < ARRAY_SIZE(vectors); i++) {
+		for (unsigned int j = 0; j < 3; j++) {
+			u64 mix13 = revelator_hash_compact(vectors[i].x, vectors[i].id,
+							   vectors[i].secret, j + 1,
+							   REVELATOR_HASH_MIX13);
+			u64 multiply_shift =
+				revelator_hash_compact(vectors[i].x, vectors[i].id,
+						       vectors[i].secret, j + 1,
+						       REVELATOR_HASH_MULTIPLY_SHIFT);
+
+			KUNIT_EXPECT_EQ(test, mix13, vectors[i].mix13[j]);
+			KUNIT_EXPECT_EQ(test, multiply_shift,
+					vectors[i].multiply_shift[j]);
+			KUNIT_EXPECT_EQ(test, revelator_pfn(mix13),
+					REVELATOR_PFN_BASE +
+					(vectors[i].mix13[j] &
+					 (REVELATOR_PFN_COUNT - 1)));
+			KUNIT_EXPECT_EQ(test, revelator_pfn(multiply_shift),
+					REVELATOR_PFN_BASE +
+					(vectors[i].multiply_shift[j] &
+					 (REVELATOR_PFN_COUNT - 1)));
+		}
+	}
+
+	KUNIT_EXPECT_EQ(test, PFN_PHYS(revelator_pfn(
+				revelator_hash_compact(0x10000000, 1, 2, 1,
+						       REVELATOR_HASH_MIX13))),
+			0xd8476000UL);
+	KUNIT_EXPECT_EQ(test, PFN_PHYS(revelator_pfn(
+				revelator_hash_compact(0x10000000, 1, 2, 1,
+						       REVELATOR_HASH_MULTIPLY_SHIFT))),
+			0x9c2b5000UL);
+}
+
 
 static unsigned long candidate_pa(unsigned long va, bool table, u64 id, u64 secret)
 {
@@ -88,6 +161,7 @@ static void revelator_sv48_addresses(struct kunit *test)
 
 static struct kunit_case revelator_hash_cases[] = {
 	KUNIT_CASE(revelator_hash_vectors),
+	KUNIT_CASE(revelator_compact_vectors),
 	KUNIT_CASE(revelator_sv48_addresses),
 	{ }
 };

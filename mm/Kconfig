@@ -1525,7 +1525,8 @@ config REVELATOR_KUNIT_TEST
 	depends on REVELATOR && KUNIT=y
 	default KUNIT_ALL_TESTS
 	help
-	  Check the fixed CityHash ABI and the Sv48 candidate addresses.
+	  Check the selected hash algorithm and fixed CityHash ABI against
+	  known vectors and the Sv48 candidate addresses.
 
 source "mm/damon/Kconfig"
 

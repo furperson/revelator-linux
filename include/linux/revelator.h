@@ -14,6 +14,7 @@ struct mm_struct;
 struct revelator_mm {
 	u64 id;
 	u64 secret;
+	u32 algorithm;
 	raw_spinlock_t lock;
 	/* Cumulative results, indexed by allocation tier (0 is fallback). */
 	u64 data[4];
@@ -24,6 +25,7 @@ DECLARE_STATIC_KEY_FALSE(revelator_placement);
 
 void __init revelator_init(void);
 void revelator_init_mm(struct mm_struct *mm);
+unsigned int revelator_hash_id(void);
 unsigned int __revelator_candidates(struct mm_struct *mm, unsigned long addr,
 				    bool table, unsigned long pfns[3]);
 

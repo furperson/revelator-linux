@@ -24,6 +24,30 @@ static enum {
 	REVELATOR_DATA,
 	REVELATOR_DATA_PT,
 } revelator_mode __initdata;
+static enum revelator_hash_algorithm revelator_algorithm =
+	REVELATOR_HASH_CITYHASH;
+
+static int __init revelator_parse_hash(char *hash)
+{
+	if (!hash)
+		return -EINVAL;
+	if (!strcmp(hash, "cityhash"))
+		revelator_algorithm = REVELATOR_HASH_CITYHASH;
+	else if (!strcmp(hash, "mix13"))
+		revelator_algorithm = REVELATOR_HASH_MIX13;
+	else if (!strcmp(hash, "multiply-shift"))
+		revelator_algorithm = REVELATOR_HASH_MULTIPLY_SHIFT;
+	else
+		return -EINVAL;
+	return 0;
+}
+early_param("revelator_hash", revelator_parse_hash);
+
+unsigned int revelator_hash_id(void)
+{
+	return revelator_algorithm;
+}
+
 
 static int __init revelator_parse_mode(char *mode)
 {
@@ -98,6 +122,7 @@ void revelator_init_mm(struct mm_struct *mm)
 	/* dup_mm() copies the parent's mm before we initialize the new one. */
 	state->id = 0;
 	state->secret = 0;
+	state->algorithm = REVELATOR_HASH_CITYHASH;
 	if (!static_branch_unlikely(&revelator_placement) || !rng_is_initialized())
 		return;
 
@@ -106,6 +131,7 @@ void revelator_init_mm(struct mm_struct *mm)
 	memset(state->pt, 0, sizeof(state->pt));
 	state->secret = get_random_u64();
 	state->id = atomic64_inc_return_relaxed(&revelator_next_id);
+	state->algorithm = revelator_hash_id();
 }
 
 unsigned int __revelator_candidates(struct mm_struct *mm, unsigned long addr,
@@ -113,17 +139,28 @@ unsigned int __revelator_candidates(struct mm_struct *mm, unsigned long addr,
 {
 	struct revelator_mm *state = &mm->revelator;
 	unsigned int nr = table ? 1 : 3;
-	u64 base;
+	u64 base = 0;
 
 	if (!state->id || (table && !revelator_place_tables))
 		return 0;
 
-	base = revelator_hash_base(revelator_key(addr, table), state->id,
-				   state->secret);
-	for (unsigned int i = 0; i < nr; i++)
-		pfns[i] = revelator_pfn(revelator_hash_seed(base, i + 1));
+	if (state->algorithm == REVELATOR_HASH_CITYHASH)
+		base = revelator_hash_base(revelator_key(addr, table), state->id,
+					   state->secret);
+	for (unsigned int i = 0; i < nr; i++) {
+		u64 hash;
+
+		if (state->algorithm == REVELATOR_HASH_CITYHASH)
+			hash = revelator_hash_seed(base, i + 1);
+		else
+			hash = revelator_hash_compact(revelator_key(addr, table),
+						     state->id, state->secret,
+						     i + 1, state->algorithm);
+		pfns[i] = revelator_pfn(hash);
+	}
 	return nr;
 }
+
 
 void revelator_account(struct mm_struct *mm, unsigned long addr, bool table,
 		       unsigned int tier, unsigned long pfn)

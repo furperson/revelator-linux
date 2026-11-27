@@ -35,6 +35,38 @@
 #define REVELATOR_PFN_BASE	(REVELATOR_RAM_BASE >> REVELATOR_PAGE_SHIFT)
 #define REVELATOR_PFN_COUNT	((REVELATOR_RAM_END - REVELATOR_RAM_BASE) >> \
 				 REVELATOR_PAGE_SHIFT)
+#define REVELATOR_HASH_GOLDEN		0x9e3779b97f4a7c15ULL
+#define REVELATOR_HASH_MULTIPLIER	0x61c8864680b583ebULL
+
+enum revelator_hash_algorithm {
+	REVELATOR_HASH_CITYHASH,
+	REVELATOR_HASH_MIX13,
+	REVELATOR_HASH_MULTIPLY_SHIFT,
+	REVELATOR_HASH_ALGORITHM_COUNT,
+};
+
+static inline u64 revelator_mix13(u64 z)
+{
+	z ^= z >> 30;
+	z *= 0xbf58476d1ce4e5b9ULL;
+	z ^= z >> 27;
+	z *= 0x94d049bb133111ebULL;
+	z ^= z >> 31;
+	return z;
+}
+
+static inline u64 revelator_hash_compact(u64 x, u64 id, u64 secret,
+					 u64 seed,
+					 enum revelator_hash_algorithm algorithm)
+{
+	u64 z = x + (revelator_mix13(id) ^ secret) +
+		seed * REVELATOR_HASH_GOLDEN;
+
+	if (algorithm == REVELATOR_HASH_MIX13)
+		return revelator_mix13(z);
+	return (z * REVELATOR_HASH_MULTIPLIER) >> 45;
+}
+
 
 static inline u64 revelator_hash_len16(u64 u, u64 v, u64 mul)
 {
